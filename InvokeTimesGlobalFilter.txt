@@ -1,0 +1,184 @@
+package com.kedacom.kiop.gateway.core.route.filter.global;
+
+import cn.hutool.core.date.DateUtil;
+import com.kedacom.kiop.gateway.core.common.CacheCommon;
+import com.kedacom.kiop.gateway.core.dto.GatewayResponse;
+import com.kedacom.kiop.gateway.core.dto.rbac.ResponseMessage;
+import com.kedacom.kiop.gateway.core.dto.sentinel.GatewayTimesEntity;
+import com.kedacom.kiop.gateway.core.constant.GatewayConstant;
+import com.kedacom.kiop.gateway.core.constant.RedisConstant;
+import com.kedacom.kiop.gateway.core.constant.ResponseConstant;
+import com.kedacom.kiop.gateway.core.util.HttpUtils;
+import com.kedacom.kiop.gateway.core.util.KiopUtils;
+import io.netty.handler.codec.http.HttpScheme;
+import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cloud.gateway.filter.GatewayFilterChain;
+import org.springframework.cloud.gateway.filter.GlobalFilter;
+import org.springframework.cloud.gateway.route.Route;
+import org.springframework.cloud.gateway.support.ServerWebExchangeUtils;
+import org.springframework.core.Ordered;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Component;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import static com.kedacom.kiop.gateway.core.constant.GatewayConstant.API_KEY;
+
+/**
+ * 该全局过滤器 用于接口次数调用管控
+ */
+@Component
+@Slf4j
+public class InvokeTimesGlobalFilter  implements GlobalFilter, Ordered {
+
+    @Value("${csp.redisson.lockAutoReleaseTime:2}")
+    private Integer lockAutoReleaseTime;
+
+    @Autowired
+    private RedissonClient redissonClient;
+
+//    @Autowired
+//    private RedissonReactiveClient redissonReactiveClient;
+
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        if (log.isTraceEnabled()) {
+            log.trace("Thread:"+Thread.currentThread().getId()+",apiKey Life "+exchange.getRequest().getQueryParams().getFirst(API_KEY)+" exec InvokeTimesGlobalFilter Pre前置过滤");
+        }
+        //不是http和https的直接过 不限制
+        String scheme = exchange.getRequest().getURI().getScheme();
+        if(!scheme.equals(HttpScheme.HTTP.name().toString()) && !scheme.equals(HttpScheme.HTTPS.name().toString())){
+            return chain.filter(exchange).then(Mono.fromRunnable(() -> {
+                if (log.isTraceEnabled()) {
+                    log.trace("Thread:"+Thread.currentThread().getId()+",apiKey Life "+exchange.getRequest().getQueryParams().getFirst(API_KEY)+" exec InvokeTimesGlobalFilter POST后置过滤");
+                }
+            }));
+        }
+
+        //检查请求中必须有 apikey 信息
+        Route route = exchange.getAttribute(ServerWebExchangeUtils.GATEWAY_ROUTE_ATTR);
+        String key = KiopUtils.getApikey(exchange,true,false);
+//        String key = exchange.getRequest().getQueryParams().getFirst(GatewayConstant.API_KEY);
+        if (!CacheCommon.valiadApikey(route.getId(), key)) {
+            return HttpUtils.responseTo(ResponseConstant.UNAUTHORIZED, exchange);
+        }
+
+        //用户级别和接口级别只会走其中一个
+        GatewayTimesEntity userGatewayTimes = CacheCommon.getUserGatewayTimes(key, route.getId());
+        Mono<Void> validaRes = null;
+        if(userGatewayTimes!=null){//走用户级别控制
+            //检查key
+            String redisKeyPrefix = key+"_"+route.getId();
+            String redisKey = redisKeyPrefix+"_"+DateUtil.today();
+            validaRes = validateInvockTimes(redisKeyPrefix,redisKey,userGatewayTimes,exchange);
+        }else{
+            GatewayTimesEntity gatewayTimes = CacheCommon.getGatewayTimes( route.getId());
+            if(gatewayTimes!=null){//走接口级别控制
+                String redisKeyPrefix = route.getId();
+                String redisKey = redisKeyPrefix+"_"+DateUtil.today();
+                validaRes = validateInvockTimes(redisKeyPrefix,redisKey,gatewayTimes,exchange);
+            }
+        }
+
+        if (validaRes!=null) {
+            return validaRes;
+        }
+
+        return chain.filter(exchange).then(Mono.fromRunnable(() -> {
+            if (log.isTraceEnabled()) {
+                log.trace("Thread:"+Thread.currentThread().getId()+",apiKey Life "+exchange.getRequest().getQueryParams().getFirst(API_KEY)+" exec InvokeTimesGlobalFilter POST后置过滤");
+            }
+
+        }));
+    }
+
+    private Mono<Void> validateInvockTimes(String redisKeyPrefix, String redisKey, GatewayTimesEntity gatewayTimes,ServerWebExchange exchange){
+
+        //加上分布式锁
+        RLock lock = redissonClient.getLock(redisKey);
+//        RLockReactive lock = redissonReactiveClient.getLock(redisKey);
+        log.info("接口配置:{},redisKeyPrefix:{},redisKey:{},开始上锁",gatewayTimes,redisKeyPrefix,redisKey);
+
+        lock.lock(lockAutoReleaseTime,TimeUnit.SECONDS);
+
+        try{
+            Map<Object, Object> entries = stringRedisTemplate.opsForHash().entries(RedisConstant.GATEWAY_TIMES);
+            String _curTimes = (String) entries.get(redisKey);
+            Integer curTimes = new Integer(0);
+            if(_curTimes!=null){
+                curTimes = Integer.parseInt(String.valueOf(_curTimes));
+            }
+            log.info("接口配置:{},redisKeyPrefix:{},redisKey:{},线程ID:{}获取到锁{}",gatewayTimes,redisKeyPrefix,redisKey,Thread.currentThread().getId(),redisKey);
+            //先检查总量
+            if (!GatewayConstant.GATEWAY_TIMES.UNLIMIT.equals(gatewayTimes.getTotalTimes())) {
+                log.info("接口配置:{},redisKeyPrefix:{},redisKey:{},检查总量",gatewayTimes,redisKeyPrefix,redisKey);
+                //获取实时总量
+                AtomicReference<Integer> tempCurTotalTimes = new AtomicReference<>(new Integer(0));
+                entries.entrySet().forEach(entry->{
+                    Integer tempTimes = Integer.parseInt(String.valueOf(entry.getValue()));
+                    String keyStr = (String)entry.getKey();
+                    if(keyStr.indexOf(redisKeyPrefix)!=-1){
+                        tempCurTotalTimes.updateAndGet(v -> v + tempTimes);
+                    }
+                });
+                //实时量小于配置量就新增次数
+                if(tempCurTotalTimes.get()>=gatewayTimes.getTotalTimes()){
+                    //总次数超过配置
+                    ResponseMessage<GatewayResponse> GATEWAY_TIMES_TOTAL_OVER = new ResponseMessage(HttpStatus.UNAUTHORIZED, GatewayResponse.builder().code(1000002).message("KIOP-GATEWAY:接口调用次数超过该接口总次数(GATEWAY_TIMES_TOTAL_OVER),每日调用次数:"+gatewayTimes.getDayTimes()+",总调用次数:"+gatewayTimes.getTotalTimes()+",目前已调用总次数:"+tempCurTotalTimes).build());
+                    return HttpUtils.responseTo(GATEWAY_TIMES_TOTAL_OVER, exchange);
+                }
+            }
+
+            //在检查每日
+            if (!GatewayConstant.GATEWAY_TIMES.UNLIMIT.equals(gatewayTimes.getDayTimes())) {
+                log.info("接口配置:{},redisKeyPrefix:{},redisKey:{},检查每日量",gatewayTimes,redisKeyPrefix,redisKey);
+                //获取实时当天量
+                //当天实时量小于配置量就新增次数
+                if(curTimes>=gatewayTimes.getDayTimes()){
+                    //每日次数超过配置
+                    ResponseMessage<GatewayResponse> GATEWAY_TIMES_DAY_OVER = new ResponseMessage(HttpStatus.UNAUTHORIZED, GatewayResponse.builder().code(1000001).message("KIOP-GATEWAY:接口调用次数超过本日次数(GATEWAY_TIMES_DAY_OVER),每日调用次数:"+gatewayTimes.getDayTimes()+",总调用次数:"+gatewayTimes.getTotalTimes()+",当日("+DateUtil.today()+")已调用次数:"+curTimes).build());
+                    return HttpUtils.responseTo(GATEWAY_TIMES_DAY_OVER, exchange);
+                }
+            }
+
+            if (entries.containsKey(redisKey)) {
+                log.info("接口配置:{},redisKeyPrefix:{},redisKey:{},存在redisKey:{}进行叠加次数1",gatewayTimes,redisKeyPrefix,redisKey,redisKey);
+                stringRedisTemplate.opsForHash().increment(RedisConstant.GATEWAY_TIMES,redisKey,1);
+            }else{
+                log.info("接口配置:{},redisKeyPrefix:{},redisKey:{},不存在redisKey:{}进行创建初始化次数1",gatewayTimes,redisKeyPrefix,redisKey,redisKey);
+                stringRedisTemplate.opsForHash().putIfAbsent(RedisConstant.GATEWAY_TIMES,redisKey,String.valueOf(1));
+            }
+
+        }catch (Exception e){
+            log.info("接口配置:{},redisKeyPrefix:{},redisKey:{},发生异常:{}",gatewayTimes,redisKeyPrefix,redisKey,e.getMessage());
+        }finally {
+//            lock.isLocked().subscribe(locked->{
+//                if (locked) {
+//                    lock.unlock();
+//                    log.info("接口配置:{},redisKeyPrefix:{},redisKey:{},线程ID:{}释放锁{}",gatewayTimes,redisKeyPrefix,redisKey,Thread.currentThread().getId(),redisKey);
+//                }
+//            });
+            if (lock.isLocked()) {
+                if(lock.isHeldByCurrentThread()){
+                    lock.unlock();
+                    log.info("接口配置:{},redisKeyPrefix:{},redisKey:{},线程ID:{}释放锁{}",gatewayTimes,redisKeyPrefix,redisKey,Thread.currentThread().getId(),redisKey);
+                }
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public int getOrder() {
+        return -2147483450;
+    }
+}
